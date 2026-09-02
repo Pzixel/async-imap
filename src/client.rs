@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::{Deref, DerefMut};
 use std::pin::Pin;
 use std::str;
@@ -20,7 +21,7 @@ use super::error::{Error, ParseError, Result, ValidateError};
 use super::parse::*;
 use super::types::*;
 use crate::extensions::{self, quota::parse_get_quota};
-use crate::imap_stream::ImapStream;
+use crate::imap_stream::{ImapStream, LiteralAwareResponse};
 
 macro_rules! quote {
     ($x:expr) => {
@@ -143,6 +144,19 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
         }
     }
 
+    /// Creates a new client whose parsed response buffer cannot grow past
+    /// `max_response_size`.
+    pub fn new_with_max_response_size(stream: T, max_response_size: NonZeroUsize) -> Client<T> {
+        let stream = ImapStream::new_with_max_response_size(stream, max_response_size);
+
+        Client {
+            conn: Connection {
+                stream,
+                request_ids: IdGenerator::new(),
+            },
+        }
+    }
+
     /// Convert this Client into the raw underlying stream.
     pub fn into_inner(self) -> T {
         let Self { conn, .. } = self;
@@ -215,12 +229,12 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                 tag,
             } = res.parsed()
             {
-                ok_or_unauth_client_err!(
-                    self.check_status_ok(status, code.as_ref(), information.as_deref()),
-                    self
-                );
-
                 if *tag == id {
+                    ok_or_unauth_client_err!(
+                        self.check_status_ok(status, code.as_ref(), information.as_deref()),
+                        self
+                    );
+
                     let capabilities =
                         if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) =
                             code
@@ -1390,6 +1404,17 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     pub async fn read_response(&mut self) -> io::Result<Option<ResponseData>> {
         self.conn.read_response().await
     }
+
+    /// Reads one response, retaining only `literal_prefix_limit` bytes when a server declares
+    /// a larger literal. A capped outcome permanently closes the response stream.
+    pub async fn read_response_with_literal_prefix(
+        &mut self,
+        literal_prefix_limit: NonZeroUsize,
+    ) -> io::Result<Option<LiteralAwareResponse>> {
+        self.conn
+            .read_response_with_literal_prefix(literal_prefix_limit)
+            .await
+    }
 }
 
 impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
@@ -1414,6 +1439,18 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
     /// Read the next response on the connection.
     pub async fn read_response(&mut self) -> io::Result<Option<ResponseData>> {
         self.stream.try_next().await
+    }
+
+    /// Reads one response, retaining only `literal_prefix_limit` bytes when a server declares
+    /// a larger literal. A capped outcome permanently closes the response stream.
+    pub async fn read_response_with_literal_prefix(
+        &mut self,
+        literal_prefix_limit: NonZeroUsize,
+    ) -> io::Result<Option<LiteralAwareResponse>> {
+        self.stream
+            .next_with_literal_prefix(literal_prefix_limit)
+            .await
+            .transpose()
     }
 
     pub(crate) async fn run_command_untagged(&mut self, command: &str) -> Result<()> {
@@ -1656,6 +1693,22 @@ mod tests {
                 unreachable!("invalid login");
             }
         }
+    }
+
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn login_ignores_completion_for_other_command_tag() {
+        let response = b"A9999 NO Other command rejected\r\n\
+                         A0001 OK Logged in\r\n"
+            .to_vec();
+        let client = mock_client!(MockStream::new(response));
+
+        let result = client.login("username", "password").await;
+
+        assert!(
+            result.is_ok(),
+            "LOGIN must use only its matching completion"
+        );
     }
 
     #[cfg_attr(feature = "runtime-tokio", tokio::test)]
