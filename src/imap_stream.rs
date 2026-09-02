@@ -174,13 +174,12 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
                 }
                 Err(nom::Err::Incomplete(Needed::Size(min))) => {
                     log::trace!("decode: incomplete data, need minimum {min} bytes");
-                    if let Some(limit) = literal_prefix_limit {
-                        if let Some(boundary) =
+                    if let Some(limit) = literal_prefix_limit
+                        && let Some(boundary) =
                             oversized_literal_boundary(buf, usize::from(min), limit)
-                        {
-                            self.decode_needs = 0;
-                            return Err(RecoverableDecodeError::OversizedLiteral(boundary));
-                        }
+                    {
+                        self.decode_needs = 0;
+                        return Err(RecoverableDecodeError::OversizedLiteral(boundary));
                     }
                     self.decode_needs = self.buffer.used() + usize::from(min);
                     Err(RecoverableDecodeError::Incomplete)
@@ -346,8 +345,10 @@ impl<R: Read + Write + Unpin> ImapStream<R> {
             if self.read_closed {
                 return Poll::Ready(None);
             }
-            let result = ready!(Pin::new(&mut *self)
-                .do_poll_next_with_literal_prefix(cx, Some(literal_prefix_limit)));
+            let result = ready!(
+                Pin::new(&mut *self)
+                    .do_poll_next_with_literal_prefix(cx, Some(literal_prefix_limit))
+            );
             if matches!(result, Some(Err(_))) {
                 self.read_closed = true;
             }

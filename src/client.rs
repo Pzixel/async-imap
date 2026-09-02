@@ -228,26 +228,24 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                 information,
                 tag,
             } = res.parsed()
+                && *tag == id
             {
-                if *tag == id {
-                    ok_or_unauth_client_err!(
-                        self.check_status_ok(status, code.as_ref(), information.as_deref()),
-                        self
-                    );
+                ok_or_unauth_client_err!(
+                    self.check_status_ok(status, code.as_ref(), information.as_deref()),
+                    self
+                );
 
-                    let capabilities =
-                        if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) =
-                            code
-                        {
-                            use crate::types::{Capabilities, Capability};
-                            let capability_set: HashSet<Capability> =
-                                capabilities.iter().map(Capability::from).collect();
-                            Some(Capabilities(capability_set))
-                        } else {
-                            None
-                        };
-                    return Ok((Session::new(self.conn), capabilities));
-                }
+                let capabilities =
+                    if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) = code
+                    {
+                        use crate::types::{Capabilities, Capability};
+                        let capability_set: HashSet<Capability> =
+                            capabilities.iter().map(Capability::from).collect();
+                        Some(Capabilities(capability_set))
+                    } else {
+                        None
+                    };
+                return Ok((Session::new(self.conn), capabilities));
             }
         }
     }
