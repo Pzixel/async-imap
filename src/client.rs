@@ -147,6 +147,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
 
     /// Creates a client with a configurable limit for each response buffer.
     /// The default limit used by [`Client::new`] is 512 MiB.
+    /// Metadata-only clients should configure a smaller limit based on their expected
+    /// response sizes. The limit includes response headers as well as literal data.
     pub fn new_with_max_response_size(stream: T, max_response_size: NonZeroUsize) -> Client<T> {
         Client {
             conn: Connection {
@@ -1406,6 +1408,7 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
     /// Reads one response, retaining a prefix when a literal exceeds `literal_prefix_limit`.
     ///
     /// A prefix outcome ends the response stream without draining the rest of the literal.
+    /// Further command writes fail with [`io::ErrorKind::BrokenPipe`].
     /// The caller must drop the connection and reconnect before issuing more commands.
     /// The response buffer limit also applies, including response headers before the literal.
     pub async fn read_response_with_literal_prefix(
@@ -1443,6 +1446,7 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
     /// Reads one response, retaining a prefix when a literal exceeds `literal_prefix_limit`.
     ///
     /// A prefix outcome ends the response stream without draining the rest of the literal.
+    /// Further command writes fail with [`io::ErrorKind::BrokenPipe`].
     /// The caller must drop the connection and reconnect before issuing more commands.
     /// The response buffer limit also applies, including response headers before the literal.
     pub async fn read_response_with_literal_prefix(
