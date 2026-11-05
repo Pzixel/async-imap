@@ -12,7 +12,9 @@ use base64::Engine as _;
 use extensions::id::{format_identification, parse_id};
 use extensions::quota::parse_get_quota_root;
 use futures_util::{Stream, TryStreamExt, io};
-use imap_proto::{Metadata, RequestId, Response};
+use imap_proto::rfc5464::Metadata;
+use imap_proto::{RequestId, Response};
+use pin_project::pin_project;
 #[cfg(feature = "runtime-tokio")]
 use tokio::io::{AsyncRead as Read, AsyncWrite as Write, AsyncWriteExt};
 
@@ -39,7 +41,9 @@ macro_rules! quote {
 // Both `Client` and `Session` deref to [`Connection`](struct.Connection.html), the underlying
 // primitives type.
 #[derive(Debug)]
+#[pin_project]
 pub struct Session<T: Read + Write + Unpin + fmt::Debug> {
+    #[pin]
     pub(crate) conn: Connection<T>,
     pub(crate) unsolicited_responses_tx: channel::Sender<UnsolicitedResponse>,
 
@@ -47,10 +51,6 @@ pub struct Session<T: Read + Write + Unpin + fmt::Debug> {
     /// [unilateral server responses in RFC 3501](https://tools.ietf.org/html/rfc3501#section-7).
     pub unsolicited_responses: channel::Receiver<UnsolicitedResponse>,
 }
-
-impl<T: Read + Write + Unpin + fmt::Debug> Unpin for Session<T> {}
-impl<T: Read + Write + Unpin + fmt::Debug> Unpin for Client<T> {}
-impl<T: Read + Write + Unpin + fmt::Debug> Unpin for Connection<T> {}
 
 // Make it possible to access the inner connection and modify its settings, such as read/write
 // timeouts.
@@ -75,7 +75,9 @@ pub struct Client<T: Read + Write + Unpin + fmt::Debug> {
 /// The underlying primitives type. Both `Client`(unauthenticated) and `Session`(after succesful
 /// login) use a `Connection` internally for the TCP stream primitives.
 #[derive(Debug)]
+#[pin_project]
 pub struct Connection<T: Read + Write + Unpin + fmt::Debug> {
+    #[pin]
     pub(crate) stream: ImapStream<T>,
 
     /// Manages the request ids.
@@ -224,19 +226,23 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
 
             if let Response::Done {
                 status,
-                code,
-                information,
+                outcome,
                 tag,
             } = res.parsed()
                 && *tag == id
             {
                 ok_or_unauth_client_err!(
-                    self.check_status_ok(status, code.as_ref(), information.as_deref()),
+                    self.check_status_ok(
+                        status,
+                        outcome.code.as_ref(),
+                        outcome.information.as_deref()
+                    ),
                     self
                 );
 
                 let capabilities =
-                    if let Some(imap_proto::types::ResponseCode::Capabilities(capabilities)) = code
+                    if let Some(imap_proto::ResponseCode::Capabilities(capabilities)) =
+                        &outcome.code
                     {
                         use crate::types::{Capabilities, Capability};
                         let capability_set: HashSet<Capability> =
@@ -320,8 +326,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
                 return Err((Error::ConnectionLost, self));
             };
             match res.parsed() {
-                Response::Continue { information, .. } => {
-                    let challenge = if let Some(text) = information {
+                Response::Continue(outcome) => {
+                    let challenge = if let Some(text) = &outcome.information {
                         ok_or_unauth_client_err!(
                             base64::engine::general_purpose::STANDARD
                                 .decode(text.as_ref())
@@ -353,10 +359,8 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Client<T> {
 }
 
 impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
-    unsafe_pinned!(conn: Connection<T>);
-
     pub(crate) fn get_stream(self: Pin<&mut Self>) -> Pin<&mut ImapStream<T>> {
-        self.conn().stream()
+        self.project().conn.project().stream
     }
 
     // not public, just to avoid duplicating the channel creation code
@@ -1416,8 +1420,6 @@ impl<T: Read + Write + Unpin + fmt::Debug + Send> Session<T> {
 }
 
 impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
-    unsafe_pinned!(stream: ImapStream<T>);
-
     /// Gets a reference to the underlying stream.
     pub fn get_ref(&self) -> &T {
         self.stream.get_ref()
@@ -1499,13 +1501,16 @@ impl<T: Read + Write + Unpin + fmt::Debug> Connection<T> {
     ) -> Result<()> {
         loop {
             if let Response::Done {
-                status,
-                code,
-                information,
                 tag,
+                status,
+                outcome,
             } = response.parsed()
             {
-                self.check_status_ok(status, code.as_ref(), information.as_deref())?;
+                self.check_status_ok(
+                    status,
+                    outcome.code.as_ref(),
+                    outcome.information.as_deref(),
+                )?;
 
                 if tag == id {
                     return Ok(());
@@ -1613,8 +1618,10 @@ mod tests {
             actual_response.parsed(),
             &Response::Data {
                 status: Status::Ok,
-                code: None,
-                information: Some(Cow::Borrowed("Dovecot ready.")),
+                outcome: imap_proto::Outcome {
+                    code: None,
+                    information: Some(Cow::Borrowed("Dovecot ready."))
+                },
             }
         );
     }
@@ -1735,6 +1742,48 @@ mod tests {
         } else {
             unreachable!("invalid login");
         }
+    }
+
+    /// Test parsing the banner of mail.systemausfall.org as returned on 2026-09-30.
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn banner_en_dash() {
+        let response = b"* OK [CAPABILITY IMAP4rev1 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ AUTH=PLAIN AUTH=LOGIN AUTH=XOAUTH2] Logged in \xe2\x80\x93 go ahead!\r\n";
+        let mock_stream = MockStream::new(response.to_vec());
+        let mut session = mock_session!(mock_stream);
+        let response_data = session.read_response().await.unwrap().unwrap();
+        let Response::Data { status, .. } = response_data.parsed() else {
+            panic!("Unexpected parsing result: {response_data:?}");
+        };
+        assert!(matches!(status, imap_proto::rfc3501::Status::Ok));
+    }
+
+    /// Example of a string that mail.systemausfall.org returned on 2026-09-14.
+    #[cfg_attr(feature = "runtime-tokio", tokio::test)]
+    #[cfg_attr(feature = "runtime-async-std", async_std::test)]
+    async fn login_with_capabilities_and_en_dash() {
+        let response = b"A0001 OK [CAPABILITY IMAP4rev1 LOGIN-REFERRALS ID ENABLE IDLE SASL-IR LITERAL+ AUTH=PLAIN AUTH=LOGIN AUTH=XOAUTH2] Logged in \xe2\x80\x93 go ahead!\r\n".to_vec();
+        let username = "username";
+        let password = "password";
+        let command = format!("A0001 LOGIN {} {}\r\n", quote!(username), quote!(password));
+        let mock_stream = MockStream::new(response);
+        let client = mock_client!(mock_stream);
+        let (session, capabilities) = client
+            .login_with_capabilities(username, password)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.stream.inner.written_buf,
+            command.as_bytes().to_vec(),
+            "Invalid login command"
+        );
+        let capabilities = capabilities.expect("Capabilities should not be None");
+        assert_eq!(capabilities.len(), 10);
+        assert!(capabilities.has(&Capability::Imap4rev1));
+        assert!(!capabilities.has(&Capability::Atom("MOVE".to_string())));
+        assert!(capabilities.has(&Capability::Atom("IDLE".to_string())));
+        assert!(capabilities.has(&Capability::Atom("ID".to_string())));
     }
 
     /// Tests that `login_with_capabilities()` returns None
